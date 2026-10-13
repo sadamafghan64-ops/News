@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-news-bot",
+  "version": "1.0.0",
+  "description": "Automatic Pashto news publisher for a WhatsApp Channel",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.18",
+    "axios": "^1.7.9",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
+    "rss-parser": "^3.13.0"
+  }
+}
