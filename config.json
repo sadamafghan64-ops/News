@@ -1,0 +1,29 @@
+{
+  "channelName": "تازه خبر",
+  "channelLink": "https://whatsapp.com/channel/0029VbDuUuF60eBgWmAxcB1W",
+  "checkIntervalMinutes": 5,
+  "downloadFolder": "temp",
+  "deleteAfterSuccessfulPost": true,
+  "newsSources": [
+    {
+      "name": "Ariana News",
+      "url": "https://ariananews.af/"
+    },
+    {
+      "name": "TOLOnews Pashto",
+      "url": "https://tolonews.com/pa"
+    },
+    {
+      "name": "BBC Pashto",
+      "url": "https://www.bbc.com/pashto"
+    },
+    {
+      "name": "VOA Pashto",
+      "url": "https://www.pashtovoa.com/"
+    },
+    {
+      "name": "Radio Azadi Pashto",
+      "url": "https://pa.azadiradio.com/"
+    }
+  ]
+}
