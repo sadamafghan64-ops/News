@@ -8,8 +8,8 @@ const express = require("express");
 const axios = require("axios");
 const Parser = require("rss-parser");
 const pino = require("pino");
+const QRCode = require("qrcode");
 const fs = require("fs");
-const path = require("path");
 
 const config = require("./config.json");
 
@@ -20,21 +20,54 @@ const PORT = process.env.PORT || 10000;
 const SESSION_DIR = "./whatsapp_sessions";
 const DATA_FILE = "./posted_news.json";
 
-let sock;
+let sock = null;
 let channelId = null;
 let isConnected = false;
 let isCheckingNews = false;
+let currentQR = null;
+let reconnectTimer = null;
+let isStarting = false;
 
-let postedNews = fs.existsSync(DATA_FILE)
-  ? JSON.parse(fs.readFileSync(DATA_FILE, "utf8"))
-  : [];
+let postedNews = [];
+let initializedSources = [];
+
+if (fs.existsSync(DATA_FILE)) {
+  try {
+    const saved = JSON.parse(
+      fs.readFileSync(DATA_FILE, "utf8")
+    );
+
+    if (Array.isArray(saved)) {
+      postedNews = saved;
+    } else {
+      postedNews = saved.postedNews || [];
+      initializedSources = saved.initializedSources || [];
+    }
+  } catch (error) {
+    console.log("Could not read saved news data.");
+  }
+}
+
+// ================================
+// WEB SERVER
+// ================================
 
 app.get("/", (req, res) => {
   res.send(`
-    <h2>WhatsApp News Bot</h2>
-    <p>Channel: ${config.channelName}</p>
-    <p>WhatsApp: ${isConnected ? "Connected" : "Waiting"}</p>
-    <p>News sources: ${config.newsSources.length}</p>
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>WhatsApp News Bot</title>
+      </head>
+      <body style="font-family:Arial;text-align:center;padding:25px">
+        <h2>📰 WhatsApp News Bot</h2>
+        <p>Channel: ${config.channelName}</p>
+        <p>WhatsApp: ${isConnected ? "Connected ✅" : "Waiting ⏳"}</p>
+        <p>News sources: ${config.newsSources.length}</p>
+        <p><a href="/qr">Open WhatsApp QR Code</a></p>
+        <p><a href="/health">Bot Health</a></p>
+      </body>
+    </html>
   `);
 });
 
@@ -42,22 +75,102 @@ app.get("/health", (req, res) => {
   res.json({
     bot: "WhatsApp News Bot",
     connected: isConnected,
+    qrAvailable: Boolean(currentQR),
     channel: config.channelName,
     channelResolved: Boolean(channelId),
-    postedNewsCount: postedNews.length
+    postedNewsCount: postedNews.length,
+    newsSources: config.newsSources.length
   });
+});
+
+// QR CODE PAGE
+app.get("/qr", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  if (isConnected) {
+    return res.send(`
+      <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta http-equiv="refresh" content="10">
+        </head>
+        <body style="font-family:Arial;text-align:center;padding:25px">
+          <h2>✅ WhatsApp Connected</h2>
+          <p>WhatsApp is already connected.</p>
+          <p><a href="/health">Check Bot Status</a></p>
+        </body>
+      </html>
+    `);
+  }
+
+  if (!currentQR) {
+    return res.send(`
+      <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta http-equiv="refresh" content="5">
+        </head>
+        <body style="font-family:Arial;text-align:center;padding:25px">
+          <h2>⏳ Waiting for QR Code</h2>
+          <p>The bot is waiting for WhatsApp.</p>
+          <p>This page refreshes automatically every 5 seconds.</p>
+          <p>If the QR does not appear, check the server console.</p>
+        </body>
+      </html>
+    `);
+  }
+
+  try {
+    const qrImage = await QRCode.toDataURL(currentQR);
+
+    res.send(`
+      <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta http-equiv="refresh" content="20">
+          <title>WhatsApp QR Code</title>
+        </head>
+        <body style="font-family:Arial;text-align:center;padding:20px">
+          <h2>📱 Connect WhatsApp</h2>
+          <p>Open WhatsApp on your phone.</p>
+          <p>Go to Settings → Linked devices → Link a device.</p>
+          <img src="${qrImage}" style="width:280px;max-width:90%;height:auto">
+          <p>Scan this QR code before it expires.</p>
+          <p>This page refreshes automatically.</p>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    res.status(500).send("Could not generate QR code.");
+  }
 });
 
 app.listen(PORT, () => {
   console.log(`Web server running on port ${PORT}`);
+  console.log("QR page endpoint: /qr");
 });
+
+// ================================
+// SAVE NEWS DATA
+// ================================
 
 function savePostedNews() {
   fs.writeFileSync(
     DATA_FILE,
-    JSON.stringify(postedNews, null, 2)
+    JSON.stringify(
+      {
+        postedNews,
+        initializedSources
+      },
+      null,
+      2
+    )
   );
 }
+
+// ================================
+// CHANNEL CONNECTION
+// ================================
 
 function getInviteCode(url) {
   const match = url.match(/channel\/([A-Za-z0-9]+)/);
@@ -84,12 +197,17 @@ async function connectChannel() {
     console.log("Channel ID:", channelId);
   } catch (error) {
     channelId = null;
+
     console.log(
       "Could not identify the channel:",
       error.message
     );
   }
 }
+
+// ================================
+// FIND NEWS RSS FEEDS
+// ================================
 
 async function discoverFeed(sourceUrl) {
   try {
@@ -130,9 +248,7 @@ async function discoverFeed(sourceUrl) {
       }
     }
 
-    if (
-      /<rss[\s>]|<feed[\s>]|<rdf:RDF[\s>]/i.test(html)
-    ) {
+    if (/<rss[\s>]|<feed[\s>]|<rdf:RDF[\s>]/i.test(html)) {
       return sourceUrl;
     }
 
@@ -148,8 +264,12 @@ async function discoverFeed(sourceUrl) {
   }
 }
 
+// ================================
+// CLEAN NEWS TEXT
+// ================================
+
 function cleanText(text = "") {
-  return text
+  return String(text)
     .replace(/<[^>]*>/g, " ")
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
@@ -159,6 +279,10 @@ function cleanText(text = "") {
     .trim();
 }
 
+// ================================
+// PUBLISH NEWS TO CHANNEL
+// ================================
+
 async function publishNews(source, item) {
   if (!sock || !isConnected || !channelId) {
     console.log("Waiting for WhatsApp channel connection.");
@@ -166,6 +290,7 @@ async function publishNews(source, item) {
   }
 
   const title = cleanText(item.title || "نوی خبر");
+
   const description = cleanText(
     item.contentSnippet || item.summary || ""
   );
@@ -180,7 +305,7 @@ async function publishNews(source, item) {
     `📌 سرچینه: ${source.name}`,
     `🔗 د خبر لینک: ${articleUrl}`,
     "",
-    `📢 زموږ چینل: ${config.channelName}`
+    `📢 چینل: ${config.channelName}`
   ].filter(Boolean).join("\n");
 
   try {
@@ -201,6 +326,10 @@ async function publishNews(source, item) {
     return false;
   }
 }
+
+// ================================
+// CHECK FOR NEW NEWS
+// ================================
 
 async function checkNews() {
   if (isCheckingNews || !isConnected || !channelId) {
@@ -223,8 +352,33 @@ async function checkNews() {
 
       try {
         const feed = await parser.parseURL(feedUrl);
+        const items = feed.items || [];
 
-        for (const item of [...feed.items].reverse()) {
+        // On the first successful scan, save existing
+        // articles as a baseline instead of publishing
+        // every old article at once.
+        if (!initializedSources.includes(source.name)) {
+          for (const item of items) {
+            const key = item.guid || item.link || item.title;
+
+            if (key && !postedNews.includes(key)) {
+              postedNews.push(key);
+            }
+          }
+
+          initializedSources.push(source.name);
+          savePostedNews();
+
+          console.log(
+            "Initial news scan completed for:",
+            source.name
+          );
+
+          continue;
+        }
+
+        // Process older items first.
+        for (const item of [...items].reverse()) {
           const key = item.guid || item.link || item.title;
 
           if (!key || postedNews.includes(key)) {
@@ -237,7 +391,7 @@ async function checkNews() {
             postedNews.push(key);
             savePostedNews();
           } else {
-            // Stop this source if publishing fails.
+            // Try again on the next check.
             break;
           }
         }
@@ -256,54 +410,88 @@ async function checkNews() {
   }
 }
 
+// ================================
+// CONNECT WHATSAPP
+// ================================
+
 async function startWhatsApp() {
-  fs.mkdirSync(SESSION_DIR, { recursive: true });
+  if (isStarting) return;
 
-  const { state, saveCreds } =
-    await useMultiFileAuthState(SESSION_DIR);
+  isStarting = true;
 
-  sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: true,
-    browser: ["News Bot", "Chrome", "1.0.0"]
-  });
+  try {
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
 
-  sock.ev.on("creds.update", saveCreds);
+    const { state, saveCreds } =
+      await useMultiFileAuthState(SESSION_DIR);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
+    sock = makeWASocket({
+      auth: state,
+      logger: pino({ level: "silent" }),
+      browser: ["News Bot", "Chrome", "1.0.0"]
+    });
 
-    if (connection === "open") {
-      isConnected = true;
-      console.log("WhatsApp connected.");
+    sock.ev.on("creds.update", saveCreds);
 
-      await connectChannel();
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-      if (channelId) {
-        checkNews();
+      if (qr) {
+        currentQR = qr;
+        console.log("QR available. Open /qr in your browser.");
       }
-    }
 
-    if (connection === "close") {
-      isConnected = false;
-      channelId = null;
+      if (connection === "open") {
+        currentQR = null;
+        isConnected = true;
 
-      const statusCode =
-        lastDisconnect?.error?.output?.statusCode;
+        console.log("WhatsApp connected successfully.");
 
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log("Reconnecting to WhatsApp...");
+        await connectChannel();
 
-        setTimeout(startWhatsApp, 5000);
-      } else {
-        console.log(
-          "WhatsApp logged out. Re-link the device."
-        );
+        if (channelId) {
+          checkNews();
+        }
       }
-    }
-  });
+
+      if (connection === "close") {
+        isConnected = false;
+        currentQR = null;
+        channelId = null;
+
+        const statusCode =
+          lastDisconnect?.error?.output?.statusCode;
+
+        if (statusCode !== DisconnectReason.loggedOut) {
+          console.log("WhatsApp disconnected. Reconnecting...");
+
+          if (!reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              isStarting = false;
+
+              startWhatsApp().catch((error) => {
+                console.log("Reconnect error:", error.message);
+              });
+            }, 5000);
+          }
+        } else {
+          console.log(
+            "WhatsApp logged out. Delete the old session only if you need to link again."
+          );
+        }
+      }
+    });
+  } catch (error) {
+    console.error("WhatsApp startup error:", error.message);
+  } finally {
+    isStarting = false;
+  }
 }
+
+// ================================
+// AUTOMATIC NEWS CHECK
+// ================================
 
 setInterval(
   checkNews,
